@@ -1,0 +1,625 @@
+// AI use: Claude was used to help write this code.
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <vector>
+#include <map>
+#include <random>
+#include <cstdint>
+using namespace std;
+ 
+// ---------- Settings ----------
+const int CHAINING = 0;                 // the four collision methods
+const int LINEAR = 1;
+const int QUADRATIC = 2;
+const int DOUBLE_HASH = 3;
+ 
+const int EMPTY = 0;                    // the three states of a slot (open addressing only)
+const int FULL = 1;
+const int REMOVED = 2;                  // a removed user leaves a marker so probing can keep going
+ 
+const int START_SIZE = 11;              // table sizes are always prime numbers
+const double MAX_LOAD = 0.5;            // rehash before the load factor would go above this
+const string PEPPER = "demo-pepper";    // one secret shared by all users, kept in the code, not in the table
+ 
+// The hash function from the assignment (for practice only, not secure)
+uint64_t demoHash(const std::string& s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h = (h ^ c) * 1099511628211ULL;
+    }
+    return h;
+}
+ 
+// ---------- Structs ----------
+struct User
+{
+    string username;
+    string salt;
+    uint64_t hash = 0;                  // demoHash(salt + password + PEPPER)
+};
+ 
+struct ChainNode                        // used by chaining
+{
+    User user;
+    ChainNode* next;
+};
+ 
+struct Slot                             // used by linear, quadratic, and double hashing
+{
+    int state = EMPTY;
+    User user;
+};
+ 
+struct HashTable
+{
+    int method = CHAINING;
+    int size = 0;                       // number of buckets (chaining) or slots (the others)
+    int count = 0;                      // users stored
+    int removed = 0;                    // REMOVED markers still in the slots
+    int rehashes = 0;                   // how many times the table has been rebuilt
+    int compares = 0;                   // username comparisons, so the methods can be compared
+    vector<ChainNode*> buckets;         // only used when method is CHAINING
+    vector<Slot> slots;                 // only used by the other three methods
+};
+ 
+// ---------- Setup ----------
+bool isPrime(int n)
+{
+    if (n < 2)
+    {
+        return false;
+    }
+    for (int i = 2; i * i <= n; i++)
+    {
+        if (n % i == 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+ 
+int nextPrime(int n)
+{
+    while (!isPrime(n))
+    {
+        n++;
+    }
+    return n;
+}
+ 
+void startEmpty(HashTable& t, int size)
+{
+    t.size = size;
+    t.count = 0;
+    t.removed = 0;
+    if (t.method == CHAINING)
+    {
+        t.buckets.assign(size, nullptr);
+    }
+    else
+    {
+        t.slots.assign(size, Slot());
+    }
+}
+ 
+HashTable newTable(int method)
+{
+    HashTable t;
+    t.method = method;
+    startEmpty(t, START_SIZE);
+    return t;
+}
+ 
+// Deletes every chaining node. Open addressing tables have nothing to free.
+void freeTable(HashTable& t)
+{
+    for (int i = 0; i < (int)t.buckets.size(); i++)
+    {
+        ChainNode* cur = t.buckets[i];
+        while (cur != nullptr)
+        {
+            ChainNode* next = cur->next;
+            delete cur;
+            cur = next;
+        }
+        t.buckets[i] = nullptr;
+    }
+}
+ 
+double loadFactor(HashTable& t)
+{
+    return (double)t.count / t.size;
+}
+ 
+string methodName(int method)
+{
+    if (method == CHAINING)
+    {
+        return "chaining";
+    }
+    if (method == LINEAR)
+    {
+        return "linear probing";
+    }
+    if (method == QUADRATIC)
+    {
+        return "quadratic probing";
+    }
+    return "double hashing";
+}
+ 
+// ---------- Where a key goes ----------
+// The first place to look for a key
+int homeIndex(HashTable& t, const string& key)
+{
+    return demoHash(key) % t.size;
+}
+ 
+// The slot to try on attempt number i (i = 0 is the home slot). This is the only place
+// where the three open addressing methods differ from each other.
+int slotFor(HashTable& t, const string& key, int i)
+{
+    int home = homeIndex(t, key);
+    if (t.method == LINEAR)
+    {
+        return (home + i) % t.size;             // home, home+1, home+2, ...
+    }
+    if (t.method == QUADRATIC)
+    {
+        return (home + i * i) % t.size;         // home, home+1, home+4, home+9, ...
+    }
+    int step = 1 + demoHash(key + "#") % (t.size - 1);     // a second hash, never 0
+    return (home + i * step) % t.size;          // jump by step each time
+}
+ 
+// ---------- The four operations ----------
+// find gives back a pointer to the user, or nullptr if there is no such user.
+// The pointer is only good until the next insert or remove.
+User* find(HashTable& t, const string& username)
+{
+    if (t.method == CHAINING)
+    {
+        for (ChainNode* cur = t.buckets[homeIndex(t, username)]; cur != nullptr; cur = cur->next)
+        {
+            t.compares++;
+            if (cur->user.username == username)
+            {
+                return &cur->user;
+            }
+        }
+        return nullptr;
+    }
+ 
+    for (int i = 0; i < t.size; i++)
+    {
+        Slot& s = t.slots[slotFor(t, username, i)];
+        if (s.state == EMPTY)
+        {
+            return nullptr;                     // an empty slot ends the search
+        }
+        if (s.state == FULL)
+        {
+            t.compares++;
+            if (s.user.username == username)
+            {
+                return &s.user;
+            }
+        }
+    }
+    return nullptr;
+}
+ 
+// Puts a user in the table with no checks (insert and rehash both use this)
+void place(HashTable& t, User user)
+{
+    if (t.method == CHAINING)
+    {
+        int b = homeIndex(t, user.username);
+        t.buckets[b] = new ChainNode{user, t.buckets[b]};      // new node goes at the front of the chain
+    }
+    else
+    {
+        for (int i = 0; i < t.size; i++)
+        {
+            Slot& s = t.slots[slotFor(t, user.username, i)];
+            if (s.state != FULL)                // take the first empty or removed slot
+            {
+                if (s.state == REMOVED)
+                {
+                    t.removed--;
+                }
+                s.state = FULL;
+                s.user = user;
+                break;
+            }
+        }
+    }
+    t.count++;
+}
+ 
+// Builds a bigger table and puts every user into it again
+void rehash(HashTable& t, int newSize)
+{
+    vector<User> all;                           // copy every user out first
+    for (ChainNode* head : t.buckets)
+    {
+        for (ChainNode* cur = head; cur != nullptr; cur = cur->next)
+        {
+            all.push_back(cur->user);
+        }
+    }
+    for (Slot& s : t.slots)
+    {
+        if (s.state == FULL)
+        {
+            all.push_back(s.user);
+        }
+    }
+ 
+    freeTable(t);
+    startEmpty(t, newSize);
+    for (User u : all)
+    {
+        place(t, u);
+    }
+    t.rehashes++;
+}
+ 
+// Returns false if the username is already taken
+bool insert(HashTable& t, User user)
+{
+    if (find(t, user.username) != nullptr)
+    {
+        return false;
+    }
+    if ((double)(t.count + t.removed + 1) / t.size > MAX_LOAD)
+    {
+        rehash(t, nextPrime(t.size * 2));
+    }
+    place(t, user);
+    return true;
+}
+ 
+// Returns false if there is no such user
+bool remove(HashTable& t, const string& username)
+{
+    if (t.method == CHAINING)
+    {
+        int b = homeIndex(t, username);
+        ChainNode* prev = nullptr;
+        for (ChainNode* cur = t.buckets[b]; cur != nullptr; cur = cur->next)
+        {
+            t.compares++;
+            if (cur->user.username == username)
+            {
+                if (prev == nullptr)
+                {
+                    t.buckets[b] = cur->next;
+                }
+                else
+                {
+                    prev->next = cur->next;
+                }
+                delete cur;
+                t.count--;
+                return true;
+            }
+            prev = cur;
+        }
+        return false;
+    }
+ 
+    for (int i = 0; i < t.size; i++)
+    {
+        Slot& s = t.slots[slotFor(t, username, i)];
+        if (s.state == EMPTY)
+        {
+            return false;
+        }
+        if (s.state == FULL)
+        {
+            t.compares++;
+            if (s.user.username == username)
+            {
+                s.state = REMOVED;              // leave a marker so other users can still be found
+                t.count--;
+                t.removed++;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+ 
+// ---------- Passwords and login ----------
+uint64_t saltState = 12345;                     // a real system would use random numbers from the operating system
+ 
+// Makes an 8 character salt. This one gives the same salts every run so the output is repeatable.
+string makeSalt()
+{
+    const string chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+    string salt = "";
+    for (int i = 0; i < 8; i++)
+    {
+        saltState = saltState * 6364136223846793005ULL + 1442695040888963407ULL;
+        salt += chars[(saltState >> 33) % chars.size()];
+    }
+    return salt;
+}
+ 
+uint64_t passwordHash(const string& salt, const string& password)
+{
+    return demoHash(salt + password + PEPPER);
+}
+ 
+User makeUser(const string& username, const string& password)
+{
+    User u;
+    u.username = username;
+    u.salt = makeSalt();
+    u.hash = passwordHash(u.salt, password);
+    return u;
+}
+ 
+void addUser(HashTable& t, const string& username, const string& password)
+{
+    int oldSize = t.size;
+    if (!insert(t, makeUser(username, password)))
+    {
+        cout << "add " << username << " -> username is taken" << endl;
+        return;
+    }
+    cout << "add " << username << endl;
+    if (t.size != oldSize)
+    {
+        cout << "  rehash: " << oldSize << " -> " << t.size << " slots, load factor is now " << loadFactor(t) << endl;
+    }
+}
+ 
+void removeUser(HashTable& t, const string& username)
+{
+    if (remove(t, username))
+    {
+        cout << "remove " << username << endl;
+    }
+    else
+    {
+        cout << "remove " << username << " -> unknown user" << endl;
+    }
+}
+ 
+void login(HashTable& t, const string& username, const string& password)
+{
+    User* user = find(t, username);
+    if (user == nullptr)
+    {
+        cout << "login " << username << " -> unknown user" << endl;
+        return;
+    }
+    if (passwordHash(user->salt, password) != user->hash)
+    {
+        cout << "login " << username << " -> wrong password" << endl;
+        return;
+    }
+    cout << "login " << username << " -> success" << endl;
+}
+ 
+// ---------- Printing ----------
+void showUser(HashTable& t, const string& username)
+{
+    User* user = find(t, username);
+    if (user == nullptr)
+    {
+        cout << username << " -> unknown user" << endl;
+        return;
+    }
+    cout << username << ": salt " << user->salt << ", hash " << user->hash << endl;
+}
+ 
+void print(HashTable& t)
+{
+    cout << methodName(t.method) << ": " << t.count << " users, " << t.size
+         << " slots, load factor " << loadFactor(t) << endl;
+    for (int i = 0; i < t.size; i++)
+    {
+        cout << "  [" << i << "]";
+        if (t.method == CHAINING)
+        {
+            if (t.buckets[i] == nullptr)
+            {
+                cout << " -";
+            }
+            for (ChainNode* cur = t.buckets[i]; cur != nullptr; cur = cur->next)
+            {
+                cout << " " << cur->user.username;
+                if (cur->next != nullptr)
+                {
+                    cout << " ->";
+                }
+            }
+        }
+        else if (t.slots[i].state == EMPTY)
+        {
+            cout << " -";
+        }
+        else if (t.slots[i].state == REMOVED)
+        {
+            cout << " (removed)";
+        }
+        else
+        {
+            cout << " " << t.slots[i].user.username;
+        }
+        cout << endl;
+    }
+}
+ 
+// Puts n users in each kind of table, then counts username comparisons per lookup
+void compareMethods(int n)
+{
+    cout << "Comparing the four methods with " << n << " users" << endl;
+    cout << "(username comparisons per lookup, lower is better)" << endl;
+    cout << left << setw(19) << "method" << setw(9) << "found" << setw(11) << "not found" << "rehashes" << endl;
+    for (int method = CHAINING; method <= DOUBLE_HASH; method++)
+    {
+        HashTable t = newTable(method);
+        for (int i = 0; i < n; i++)
+        {
+            User u;
+            u.username = "user" + to_string(i);
+            insert(t, u);
+        }
+ 
+        t.compares = 0;
+        for (int i = 0; i < n; i++)
+        {
+            find(t, "user" + to_string(i));            // these users are in the table
+        }
+        double found = (double)t.compares / n;
+ 
+        t.compares = 0;
+        for (int i = 0; i < n; i++)
+        {
+            find(t, "nobody" + to_string(i));          // these users are not
+        }
+        double notFound = (double)t.compares / n;
+ 
+        cout << left << setw(19) << methodName(method) << setw(9) << found << setw(11) << notFound << t.rehashes << endl;
+        freeTable(t);
+    }
+    cout << endl;
+}
+ 
+// ---------- Extra test ----------
+// Runs random inserts, removes, and finds on all four methods and checks every answer against
+// a std::map. The map is only the answer key here. It is never used to store the users.
+void testAgainstMap()
+{
+    mt19937 rng(42);
+    int operations = 0;
+    int failures = 0;
+ 
+    for (int method = CHAINING; method <= DOUBLE_HASH; method++)
+    {
+        for (int round = 0; round < 20; round++)
+        {
+            HashTable t = newTable(method);
+            map<string, string> answer;                 // username -> password
+            int names = 5 + rng() % 300;                // how many different usernames this round uses
+ 
+            for (int step = 0; step < 3000; step++)
+            {
+                string name = "u" + to_string(rng() % names);
+                int what = rng() % 3;
+                operations++;
+ 
+                if (what == 0)
+                {
+                    string password = "pw" + to_string(rng() % 1000);
+                    bool added = insert(t, makeUser(name, password));
+                    if (added != (answer.count(name) == 0))
+                    {
+                        failures++;
+                    }
+                    if (added)
+                    {
+                        answer[name] = password;
+                    }
+                }
+                else if (what == 1)
+                {
+                    bool removed = remove(t, name);
+                    if (removed != (answer.count(name) == 1))
+                    {
+                        failures++;
+                    }
+                    answer.erase(name);
+                }
+                else
+                {
+                    User* u = find(t, name);
+                    if ((u != nullptr) != (answer.count(name) == 1))
+                    {
+                        failures++;
+                    }
+                    else if (u != nullptr && u->hash != passwordHash(u->salt, answer[name]))
+                    {
+                        failures++;
+                    }
+                }
+                if (t.count != (int)answer.size())
+                {
+                    failures++;
+                }
+            }
+ 
+            for (auto& pair : answer)
+            {
+                if (find(t, pair.first) == nullptr)
+                {
+                    failures++;
+                }
+            }
+            freeTable(t);
+        }
+    }
+    cout << "Reference test: " << operations << " operations, " << failures << " failures" << endl;
+}
+ 
+// ---------- Demo ----------
+// Every function above prints what it did, so each line below is one step.
+// Chaining tables use new, so call freeTable on them at the end or the nodes leak.
+ 
+int main()
+{
+    cout << fixed << setprecision(2);
+ 
+    cout << "=== Login demo (chaining, the method I chose) ===" << endl;
+    HashTable users = newTable(CHAINING);
+    addUser(users, "alice", "tiger123");
+    addUser(users, "erin", "sunshine!");
+    addUser(users, "bob", "blue-sky");
+    addUser(users, "grace", "summer99");
+    addUser(users, "heidi", "orange55");
+    showUser(users, "alice");
+    showUser(users, "erin");
+    showUser(users, "bob");
+    showUser(users, "grace");
+    showUser(users, "heidi");
+    print(users);                               // erin, grace, and heidi all land in the same bucket
+    addUser(users, "frank", "hunter22");        // the 6th user passes the load limit, so the table rehashes
+    print(users);
+    addUser(users, "bob", "other");             // that username is taken
+    login(users, "alice", "tiger123");          // success
+    login(users, "alice", "wrongpass");         // wrong password
+    login(users, "mallory", "anything");        // unknown user
+    removeUser(users, "bob");
+    login(users, "bob", "blue-sky");            // bob is gone
+    removeUser(users, "bob");                   // already gone
+    print(users);
+    freeTable(users);
+    cout << endl;
+ 
+    cout << "=== The other three methods on the same users ===" << endl;
+    for (int method = LINEAR; method <= DOUBLE_HASH; method++)
+    {
+        HashTable t = newTable(method);
+        insert(t, makeUser("alice", "tiger123"));
+        insert(t, makeUser("erin", "sunshine!"));
+        insert(t, makeUser("bob", "blue-sky"));
+        insert(t, makeUser("grace", "summer99"));
+        insert(t, makeUser("heidi", "orange55"));
+        print(t);                               // erin, grace, and heidi want the same slot
+        removeUser(t, "grace");
+        print(t);
+        login(t, "heidi", "orange55");          // still found after the removal
+        login(t, "grace", "summer99");
+        cout << endl;
+    }
+ 
+    compareMethods(1000);
+    testAgainstMap();
+    return 0;
+}
